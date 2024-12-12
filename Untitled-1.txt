@@ -1,0 +1,1121 @@
+/*******************************************************
+This program was created by the
+CodeWizardAVR V3.08 Advanced
+Automatic Program Generator
+© Copyright 1998-2013 Pavel Haiduc, HP InfoTech s.r.l.
+http://www.hpinfotech.com
+
+Project : 
+Version : 
+Date    : 04/11/2023
+Author  : 
+Company : 
+Comments: 
+
+
+Chip type               : ATmega328
+Program type            : Application
+AVR Core Clock frequency: 8.000000 MHz
+Memory model            : Small
+External RAM size       : 0
+Data Stack size         : 512
+*******************************************************/
+/*                         ___________ ___________
+     (PCINT14/RESET) PC6__|1          V         28|__PC5 MON7
+PCINT16/RXD  FIN_BOT PD0__|2                    27|__PC4 MON5   
+       (PCINT17/TXD) PD1__|3                    26|__PC3 D7
+               MON8  PD2__|4                    25|__PC2 D6 (ADC2/PCINT10)
+               MON6  PD3__|5                    24|__PC1 D5 (ADC1/PCINT9)_____D1
+                RL5  PD4__|6                    23|__PC0 D4 (ADC0/PCINT8)_____D0
+                     VCC__|7                    22|__GND
+                     GND__|8       ATMEGA328P   21|__AREF
+               MON4  PB6__|9                    20|__AVCC    
+               MON3  PB7__|10                   19|__PB5 ATRAS (SCK/PCINT5)
+               MON2  PD5__|11                   18|__PB4 ADELANTE (MISO/PCINT4)
+               MON1  PD6__|12                   17|__PB3 ARRIBA (MOSI/OC2A/PCINT3)
+              ABAJO  PD7__|13                   16|__PB2 EN (SS/OC1B/PCINT2)
+                 RS  PB0__|14                   15|__PB1 RD
+                          |_______________________|
+*/
+#include <mega328.h>
+#include <alcd.h>
+#include <delay.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <sleep.h>
+#include <gpsSoftware/gpsSoftware.h>
+#include <simGprs/simGprs.h>
+
+#define VENTA       PIND.6
+#define PRODUCTO    PIND.5
+#define COFRE       PINB.7
+#define SENSOR_LDR  PINB.6      //1Wire
+#define LDR_PW      PORTD.4
+#define ADC_VOLTAGE PINC.5      //ADC5
+#define MODGPS_PW   PORTD.3
+#define MODSIM_PW   PORTC.4
+#define PILOTO2     PORTB.4
+#define PILOTO1     PORTB.3  
+
+//  ESTADO
+
+#define SLEEP   0
+#define MENSAJE   1
+#define ALERTA   2
+#define RESPONSE_FIREBASE2   3
+#define LDR   3
+
+// Declare your global variables here
+unsigned int timerSendFirebase, j;
+unsigned char url [] = {"https://registro-de-alertas-5b159-default-rtdb.firebaseio.com/Users/0000F/Maquinas/0005/Logs.json"};
+unsigned char JSONLegacy[256];
+unsigned int jsonSize = sizeof(JSONLegacy) -1;
+bit fire,ventaSignal, inicialLog;
+bit cero,uno,inicio_rx,Producto;          //variables para rutina recepcion RF
+unsigned char n_bits_rx;
+unsigned int caseLog;
+unsigned long dato_trab; 
+unsigned long datore;
+unsigned char comando;
+unsigned char cadena[20];
+unsigned int venta,tarifa,intentos,limiteventas,limiteMonto,Stock,ventatotal,updateStockemprom;
+unsigned int tiempoLog,ventaTotal,estadoMAIN;
+unsigned int timerDeletedata;
+unsigned int j, pres;
+
+
+eeprom unsigned int e_Venta;//debe de ser persistente?
+eeprom unsigned int e_Inventario;//debe de ser persistente?
+eeprom unsigned int e_Tarifa;//tarifa de producto
+eeprom unsigned int e_TiempoLog;// de log
+eeprom unsigned int e_LimiteVentas;// de ventas para enviar log
+eeprom unsigned int e_LimiteMonto;// de ventas para enviar log
+eeprom unsigned int e_numeroReintentos;// reintentos para enviar log
+eeprom unsigned int e_Inventariobajo;// reintentos para enviar log
+
+
+
+#define TEST 0
+//prototipado de funciones
+void conectServer(void);
+void getJSON(void);
+void sendFireBase(void);
+void sendLog(void);
+void inicializarSim800(void);
+void recepcionLdr(void);
+
+// Timer 0 overflow interrupt service routine
+interrupt [TIM0_OVF] void timer0_ovf_isr(void)
+{
+// Place your code here
+    if(timerSendFirebase)timerSendFirebase--;
+    if(timerDeletedata)timerDeletedata--; 
+          
+}
+// Timer1 overflow interrupt service routine
+interrupt [TIM1_OVF] void timer1_ovf_isr(void)
+{
+    // Reinitialize Timer1 value
+    //TCNT1H=0x00;
+    //TCNT1L=0x00;
+    // Place your code here  
+    //TCCR1B &= 0xF8;
+    
+    if(tiempoLog)tiempoLog--;
+    if(!timerDeletedata){
+        cero=0;
+        uno=0;
+        inicio_rx = 0;
+        n_bits_rx = 0; 
+        dato_trab = 0;   
+    }
+         
+}
+
+//Software --1Wire
+// Pin change 0-7 interrupt service routine 
+interrupt [PC_INT0] void pin_change_isr0(void)
+{
+// Place your code here
+    if(SENSOR_LDR && !fire)
+    {
+        for(j=0;j<266;j++)
+        {
+            delay_ms(1);
+            if(SENSOR_LDR)
+            {
+                pres++;
+            }   
+            if(!SENSOR_LDR)
+            {
+                break;
+            }
+        }
+        if(pres >= 180 && pres <= 220) //200   
+        {       
+             dato_trab <<= 1;
+             pres = 0;
+             n_bits_rx++;
+             dato_trab |= 1;
+             timerDeletedata = 45;
+             tiempoLog = e_TiempoLog;
+             estadoMAIN = LDR;
+        }                          
+        else if (pres >= 85 && pres <= 115)  //100    
+        {       
+             dato_trab <<= 1;
+             n_bits_rx++;
+             pres = 0;
+             timerDeletedata = 45;
+             tiempoLog = e_TiempoLog;
+             estadoMAIN = LDR;
+        }else {
+            dato_trab = 0;
+            timerDeletedata = 45;
+            tiempoLog = e_TiempoLog;
+        }
+        pres = 0;
+        estadoMAIN = LDR;
+           
+    }
+    
+     if(!COFRE)
+    {
+            lcd_gotoxy(0,2);
+            lcd_putsf("COFRE");
+            caseLog = 2;
+            tiempoLog = e_TiempoLog;
+            sendLog();
+            //log bandeja de COFRE
+    }
+}
+
+// Pin change 16-23 interrupt service routine
+interrupt [PC_INT2] void pin_change_isr2(void)
+{
+// Place your code here
+    if(VENTA)
+    {
+        delay_ms(25);
+        if(VENTA){
+            ventaSignal = 1;
+            PILOTO1 = 1;
+            estadoMAIN = ALERTA;
+        }
+    }
+    
+     if(!PRODUCTO)
+     {       
+         delay_ms(25);
+         if(!PRODUCTO){
+            Producto = 1;
+            estadoMAIN = ALERTA;
+         }
+         
+         
+            lcd_gotoxy(0,2);
+            lcd_putsf("PRODUCTO");
+            caseLog = 3;
+            tiempoLog = e_TiempoLog;
+            sendLog();
+            //log bandeja de producto
+    }  
+
+}
+
+void main(void)
+{
+// Declare your local variables here
+
+// Crystal Oscillator division factor: 1
+#pragma optsize-
+CLKPR=(1<<CLKPCE);
+CLKPR=(0<<CLKPCE) | (0<<CLKPS3) | (0<<CLKPS2) | (0<<CLKPS1) | (0<<CLKPS0);
+#ifdef _OPTIMIZE_SIZE_
+#pragma optsize+
+#endif
+// Input/Output Ports initialization
+// Port B initialization
+// Function: Bit7=In Bit6=In Bit5=In Bit4=Out Bit3=Out Bit2=In Bit1=In Bit0=In 
+DDRB=(0<<DDB7) | (0<<DDB6) | (0<<DDB5) | (1<<DDB4) | (1<<DDB3) | (0<<DDB2) | (0<<DDB1) | (0<<DDB0);
+// State: Bit7=T Bit6=T Bit5=T Bit4=T Bit3=T Bit2=T Bit1=T Bit0=T 
+PORTB=(0<<PORTB7) | (0<<PORTB6) | (0<<PORTB5) | (0<<PORTB4) | (0<<PORTB3) | (0<<PORTB2) | (0<<PORTB1) | (0<<PORTB0);
+
+// Port C initialization
+// Function: Bit6=In Bit5=In Bit4=oUT Bit3=In Bit2=In Bit1=In Bit0=In 
+DDRC=(0<<DDC6) | (0<<DDC5) | (1<<DDC4) | (0<<DDC3) | (0<<DDC2) | (0<<DDC1) | (0<<DDC0);
+// State: Bit6=T Bit5=T Bit4=T Bit3=T Bit2=T Bit1=T Bit0=T 
+PORTC=(0<<PORTC6) | (0<<PORTC5) | (0<<PORTC4) | (0<<PORTC3) | (0<<PORTC2) | (0<<PORTC1) | (0<<PORTC0);
+
+// Port D initialization
+// Function: Bit7=In Bit6=In Bit5=In Bit4=Out Bit3=Out Bit2=In Bit1=In Bit0=In 
+DDRD=(0<<DDD7) | (0<<DDD6) | (0<<DDD5) | (1<<DDD4) | (1<<DDD3) | (0<<DDD2) | (0<<DDD1) | (0<<DDD0);
+// State: Bit7=T Bit6=T Bit5=T Bit4=T Bit3=T Bit2=T Bit1=T Bit0=T 
+PORTD=(0<<PORTD7) | (0<<PORTD6) | (0<<PORTD5) | (0<<PORTD4) | (0<<PORTD3) | (0<<PORTD2) | (0<<PORTD1) | (0<<PORTD0);
+
+// Timer/Counter 0 initialization
+// Clock source: System Clock
+// Clock value: 7.813 kHz
+// Mode: Normal top=0xFF
+// OC0A output: Disconnected
+// OC0B output: Disconnected
+// Timer Period: 32.768 ms
+TCCR0A=(0<<COM0A1) | (0<<COM0A0) | (0<<COM0B1) | (0<<COM0B0) | (0<<WGM01) | (0<<WGM00);
+TCCR0B=(0<<WGM02) | (1<<CS02) | (0<<CS01) | (1<<CS00);
+TCNT0=0x00;
+OCR0A=0x00;
+OCR0B=0x00;
+
+// Timer/Counter 1 initialization
+// Clock source: System Clock
+// Clock value: 31.250 kHz
+// Mode: Normal top=0xFFFF
+// OC1A output: Disconnected
+// OC1B output: Disconnected
+// Noise Canceler: Off
+// Input Capture on Falling Edge
+// Timer Period: 2.0972 s
+// Timer1 Overflow Interrupt: On
+// Input Capture Interrupt: Off
+// Compare A Match Interrupt: Off
+// Compare B Match Interrupt: Off
+TCCR1A=(0<<COM1A1) | (0<<COM1A0) | (0<<COM1B1) | (0<<COM1B0) | (0<<WGM11) | (0<<WGM10);
+TCCR1B=(0<<ICNC1) | (0<<ICES1) | (0<<WGM13) | (0<<WGM12) | (1<<CS12) | (0<<CS11) | (0<<CS10);
+TCNT1H=0x00;
+TCNT1L=0x00;
+ICR1H=0x00;
+ICR1L=0x00;
+OCR1AH=0x00;
+OCR1AL=0x00;
+OCR1BH=0x00;
+OCR1BL=0x00;
+
+// Timer/Counter 0 Interrupt(s) initialization
+TIMSK0=(0<<OCIE0B) | (0<<OCIE0A) | (1<<TOIE0);
+
+// Timer/Counter 1 Interrupt(s) initialization
+TIMSK1=(0<<ICIE1) | (0<<OCIE1B) | (0<<OCIE1A) | (1<<TOIE1);
+
+// External Interrupt(s) initialization
+// INT1: Off
+// Interrupt on any change on pins PCINT0-7: On
+// Interrupt on any change on pins PCINT8-14: Off
+// Interrupt on any change on pins PCINT16-23: On
+PCICR=(1<<PCIE2) | (0<<PCIE1) | (1<<PCIE0);
+PCMSK0=(0<<PCINT7) | (1<<PCINT6) | (0<<PCINT5) | (0<<PCINT4) | (0<<PCINT3) | (0<<PCINT2) | (0<<PCINT1) | (0<<PCINT0);
+PCMSK2=(0<<PCINT23) | (1<<PCINT22) | (0<<PCINT21) | (0<<PCINT20) | (0<<PCINT19) | (0<<PCINT18) | (0<<PCINT17) | (0<<PCINT16);
+PCIFR=(1<<PCIF2) | (0<<PCIF1) | (1<<PCIF0);
+
+// Analog Comparator initialization
+// Analog Comparator: Off
+// The Analog Comparator's positive input is
+// connected to the AIN0 pin
+// The Analog Comparator's negative input is
+// connected to the AIN1 pin
+ACSR=(1<<ACD) | (0<<ACBG) | (0<<ACO) | (0<<ACI) | (0<<ACIE) | (0<<ACIC) | (0<<ACIS1) | (0<<ACIS0);
+ADCSRB=(0<<ACME);
+// Digital input buffer on AIN0: On
+// Digital input buffer on AIN1: On
+DIDR1=(0<<AIN0D) | (0<<AIN1D);
+
+// ADC initialization
+// ADC disabled
+ADCSRA=(0<<ADEN) | (0<<ADSC) | (0<<ADATE) | (0<<ADIF) | (0<<ADIE) | (0<<ADPS2) | (0<<ADPS1) | (0<<ADPS0);
+
+// SPI initialization
+// SPI disabled
+SPCR=(0<<SPIE) | (0<<SPE) | (0<<DORD) | (0<<MSTR) | (0<<CPOL) | (0<<CPHA) | (0<<SPR1) | (0<<SPR0);
+
+// TWI initialization
+// TWI disabled
+TWCR=(0<<TWEA) | (0<<TWSTA) | (0<<TWSTO) | (0<<TWEN) | (0<<TWIE);
+
+// Alphanumeric LCD initialization
+// Connections are specified in the
+// Project|Configure|C Compiler|Libraries|Alphanumeric LCD menu:
+// RS - PORTB Bit 0
+// RD - PORTB Bit 1
+// EN - PORTB Bit 2
+// D4 - PORTC Bit 0
+// D5 - PORTC Bit 1
+// D6 - PORTC Bit 2
+// D7 - PORTC Bit 3
+// Characters/line: 20
+//inicialización de recursos
+#asm("sei")
+lcd_init(20);
+
+if (e_TiempoLog == 0xFFFF){
+    e_TiempoLog = 86400;
+    tiempoLog = e_TiempoLog;
+}else {
+   tiempoLog = e_TiempoLog;
+}
+if (e_Venta == 0xFFFF){
+    e_Venta = 0;
+    venta = e_Venta;
+}else {
+   venta = e_Venta;
+}
+if (e_Inventario == 0xFFFF){
+    e_Inventario = 50;
+    Stock = e_Inventario;
+}else {
+   Stock = e_Inventario;
+}
+if (e_Tarifa == 0xFFFF){
+    e_Tarifa = 10;
+    tarifa = e_Tarifa;
+}else {
+   tarifa = e_Tarifa;
+}
+if (e_LimiteVentas == 0xFFFF){
+    e_LimiteVentas = 5;
+    limiteventas = e_LimiteVentas;
+}else {
+   limiteventas = e_LimiteVentas;
+}
+if (e_LimiteMonto == 0xFFFF){
+    e_LimiteMonto = 1000;
+    limiteMonto = e_LimiteMonto;
+}else {
+   limiteMonto = e_LimiteMonto;
+}
+if (e_numeroReintentos == 0xFFFF){
+    e_numeroReintentos = 2;
+    intentos = e_numeroReintentos;        
+}else {
+   intentos = e_numeroReintentos;
+}
+if (e_Inventariobajo == 0xFFFF){
+    e_Inventariobajo = 10;       
+}
+MODGPS_PW = 1;
+MODSIM_PW = 1;
+gpsSoftware_inicializar();
+simGprs_inicializar();
+inicializarSim800();
+inicialLog = 1;
+while (1)
+      {
+      // Place your code here
+        //lcd_clear();
+        if(inicialLog){
+            inicialLog = 0;
+            caseLog = 4;
+            tiempoLog = e_TiempoLog;
+            sendLog();
+        } 
+        if(!PRODUCTO)
+        {
+            lcd_gotoxy(0,2);
+            lcd_putsf("PRODUCTO");
+            caseLog = 3;
+            tiempoLog = e_TiempoLog;
+            sendLog();
+            //log bandeja de producto
+        }  
+        if(!COFRE)
+        {
+            lcd_gotoxy(0,2);
+            lcd_putsf("COFRE");
+            caseLog = 2;
+            tiempoLog = e_TiempoLog;
+            sendLog();
+            //log bandeja de COFRE
+        }
+        if (ventaSignal)
+        {  
+           venta = venta + tarifa;
+           e_Venta = venta;
+           limiteventas--;
+           Stock--;
+           e_Inventario = Stock;
+           lcd_gotoxy(0,2);
+           lcd_putsf("VENTA");
+           ventaSignal =0;
+           delay_ms(800);
+           PILOTO1 = 0;
+        }
+        if(!limiteventas) 
+        {   
+            limiteventas = e_LimiteVentas;
+            caseLog = 1;
+            tiempoLog = e_TiempoLog;
+            sendLog();
+        }
+        if (e_Venta >= limiteMonto){
+           limiteMonto = e_LimiteMonto;
+           caseLog = 8;
+           tiempoLog = e_TiempoLog;
+            sendLog(); 
+        }
+        if (Stock == e_Inventariobajo && !tiempoLog && !fire)
+        {
+            caseLog = 11;
+            tiempoLog = e_TiempoLog;
+            sendLog();
+        }
+        
+        if(!tiempoLog){
+            tiempoLog = e_TiempoLog;
+            lcd_clear();
+            caseLog = 13;
+            sendLog();
+        }
+        ltoa(n_bits_rx,cadena);
+        lcd_gotoxy(0,0);
+        lcd_putsf("n_bits_rx: ");
+        lcd_puts(cadena);
+        itoa(pres,cadena);
+        lcd_gotoxy(0,1);;
+        for (i = 0; i< sizeof(firebaseResponse); i++) 
+        {
+            
+            lcd_putchar(firebaseResponse[i]);
+        }
+        recepcionLdr(); //sensor LDR                   
+        sendFireBase();
+      }
+}
+
+void getJSON(void)
+{
+    int state = 0;
+    strncpy(JSONLegacy, "{\"Log\":\"", sizeof(JSONLegacy) - 1); // Inicializa JSONLegacy con la parte inicial del JSON 
+    
+
+    switch (caseLog) {
+        case 1:
+            strcat(JSONLegacy, "VENTA: ");
+            state = 2;
+            break;
+        case 2:
+            strcat(JSONLegacy, "COFRE ABIERTO  ");
+            state = 3;
+            break;
+        case 3:
+            strcat(JSONLegacy, "COFRE DE PRODUCTO ABIERTO");
+            state = 0;
+            break;
+        case 4:
+            strcat(JSONLegacy, "ENCENDIDO");
+            state = 0;
+            break;
+        case 5:
+            strcat(JSONLegacy, "INGRESO DE INVENTARIO: ");
+            state = 1;
+            break;
+        case 6:
+            strcat(JSONLegacy, "CAMBIO DE TARIFA:");
+            state = 4;
+            break;
+        case 7:
+            strcat(JSONLegacy, "CAMBIO DE TIEMPO DE MENSAJE EN HORAS: ");
+            state = 5;
+            break;
+        case 8:
+            strcat(JSONLegacy, "LIMITE DE DINERO DE COFRE: ");
+            state = 6;
+            break;
+        case 9:
+            strcat(JSONLegacy, "CAMBIO DE NUM. DE REINTENTOS DE ENVIO: ");
+            state = 7;
+            break;
+        case 10:
+            strcat(JSONLegacy, "CAMBIO DE CANTIDAD DE VENTAS: ");
+            state = 8;
+            break;
+        case 11:
+            strcat(JSONLegacy, "INVENTARIO BAJO");
+            state = 0;
+            break;
+        case 12:
+            strcat(JSONLegacy, "CAMBIO DE INVENTARIO BAJO");
+            state = 9;
+            break;
+        case 13:
+            strcat(JSONLegacy, "MENSAJE RUTINARIO");
+            state = 10;
+            break;
+            
+            
+    }
+    
+    switch (state) {
+        case 1:
+            snprintf(JSONLegacy + strlen(JSONLegacy), sizeof(JSONLegacy) - strlen(JSONLegacy), "%d", updateStockemprom);
+            updateStockemprom = 0;
+            break;
+        case 2:
+            strcat(JSONLegacy, "V:");
+            snprintf(JSONLegacy + strlen(JSONLegacy), sizeof(JSONLegacy) - strlen(JSONLegacy), "%d", venta);
+            venta = 0;
+            break;
+        case 3:
+            strcat(JSONLegacy, "DINERO EN COFRE: ");
+            snprintf(JSONLegacy + strlen(JSONLegacy), sizeof(JSONLegacy) - strlen(JSONLegacy), "%d", e_Venta);
+            e_Venta = 0;
+            break;
+        case 4:
+            snprintf(JSONLegacy + strlen(JSONLegacy), sizeof(JSONLegacy) - strlen(JSONLegacy), "%d", e_Tarifa);
+            break;
+        case 5:
+            snprintf(JSONLegacy + strlen(JSONLegacy), sizeof(JSONLegacy) - strlen(JSONLegacy), "%d", e_TiempoLog);
+            break;
+        case 6:
+            snprintf(JSONLegacy + strlen(JSONLegacy), sizeof(JSONLegacy) - strlen(JSONLegacy), "%d", e_LimiteMonto);
+            break;
+        case 7:
+            snprintf(JSONLegacy + strlen(JSONLegacy), sizeof(JSONLegacy) - strlen(JSONLegacy), "%d", e_numeroReintentos);
+            break;
+        case 8:
+            snprintf(JSONLegacy + strlen(JSONLegacy), sizeof(JSONLegacy) - strlen(JSONLegacy), "%d", e_LimiteVentas);
+            break;
+        case 9:
+            snprintf(JSONLegacy + strlen(JSONLegacy), sizeof(JSONLegacy) - strlen(JSONLegacy), "%d", e_Inventariobajo);
+            break;
+        case 10:
+            strcat(JSONLegacy, " ");
+            strcat(JSONLegacy, "V:");
+            snprintf(JSONLegacy + strlen(JSONLegacy), sizeof(JSONLegacy) - strlen(JSONLegacy), "%d", e_Venta);
+            break;
+        // Otros casos si es necesario
+        default:
+            strcat(JSONLegacy, " ");
+            break;
+    }
+
+    
+    strcat(JSONLegacy, " ");    
+    strcat(JSONLegacy, " STOCKTOTAL:");
+    snprintf(JSONLegacy + strlen(JSONLegacy), sizeof(JSONLegacy) - strlen(JSONLegacy), "%d", Stock);
+    strcat(JSONLegacy, " ");
+    strcat(JSONLegacy, hora);
+    strcat(JSONLegacy, " "); 
+    strncat(JSONLegacy, u8BufferGps,sizeof(u8BufferGps));
+    strcat(JSONLegacy, " ");
+    strcat(JSONLegacy, "\"}");
+     
+    for (i=0;i < sizeof(JSONLegacy);i++)
+    {
+        if (JSONLegacy[i] < 0x20 || JSONLegacy[i] > 0x7A){
+              if (JSONLegacy[i] !=  0x7B && JSONLegacy[i] !=  0x7D){
+                    JSONLegacy[i] = 0x20;
+              }
+        }
+    }
+
+}
+
+void sendLog(void){
+
+    
+    if(!fire) 
+    {
+       
+        simGprs_gprsConect();
+        conectServer();                 
+        simGprs_getTime();
+        delay_ms(300);
+        getJSON();
+        fire = 1;
+    }   
+   
+}
+
+
+void sendFireBase(void){
+
+static unsigned char estado;
+    
+    if(fire && !timerSendFirebase)  
+    {   
+//        lcd_clear();
+//        lcd_gotoxy(0,0);
+//        lcd_putsf("entro");
+         
+            switch(estado)
+            {
+                case 0:              
+                            timerSendFirebase = 45;//*32ms=~1000ms
+                            putchar('A'); 
+                            putchar('T'); 
+                            putchar('+'); 
+                            putchar('H'); 
+                            putchar('T'); 
+                            putchar('T'); 
+                            putchar('P'); 
+                            putchar('I'); 
+                            putchar('N'); 
+                            putchar('I'); 
+                            putchar('T'); 
+                            putchar(0x0D); 
+                            putchar(0x0A); 
+                            estado = 1; 
+                            break;
+                case 1:
+                            timerSendFirebase = 45;//*32ms=~1000ms 
+                            putchar('A'); 
+                            putchar('T'); 
+                            putchar('+'); 
+                            putchar('H'); 
+                            putchar('T'); 
+                            putchar('T'); 
+                            putchar('P'); 
+                            putchar('S'); 
+                            putchar('S'); 
+                            putchar('L'); 
+                            putchar('=');
+                            putchar('1'); 
+                            putchar(0x0D); 
+                            putchar(0x0A); 
+                            estado = 2;        
+                            break;
+                case 2:
+                            timerSendFirebase = 45;//*32ms=~1000ms
+                            putchar('A'); 
+                            putchar('T'); 
+                            putchar('+'); 
+                            putchar('H'); 
+                            putchar('T');  
+                            putchar('T'); 
+                            putchar('P'); 
+                            putchar('P'); 
+                            putchar('A'); 
+                            putchar('R'); 
+                            putchar('A'); 
+                            putchar('='); 
+                            putchar('"'); 
+                            putchar('C'); 
+                            putchar('I'); 
+                            putchar('D'); 
+                            putchar('"'); 
+                            putchar(','); 
+                            putchar('1'); 
+                            putchar(0x0D); 
+                            putchar(0x0A);
+                            estado = 3;
+                            break;
+                case 3:
+                
+                            timerSendFirebase = 45;//*32ms=~1000ms
+                            putchar('A');
+                            putchar('T');
+                            putchar('+');
+                            putchar('H');
+                            putchar('T');
+                            putchar('T');
+                            putchar('P');
+                            putchar('P');
+                            putchar('A');
+                            putchar('R');
+                            putchar('A');
+                            putchar('=');
+                            putchar('"');
+                            putchar('U');
+                            putchar('R');
+                            putchar('L');
+                            putchar('"');
+                            putchar(',');       
+                                  
+                            for (i = 0; i < strlen(url); i++) 
+                            {
+                                putchar(url[i]);         //Envio de url
+                            }
+                                  
+                            putchar(0x0D); 
+                            putchar(0x0A);
+                            estado = 4;
+                            break; 
+                case 4: 
+                            timerSendFirebase = 45;//*32ms=~1000ms
+                            putchar('A');
+                            putchar('T'); 
+                            putchar('+'); 
+                            putchar('H'); 
+                            putchar('T'); 
+                            putchar('T'); 
+                            putchar('P'); 
+                            putchar('P'); 
+                            putchar('A'); 
+                            putchar('R'); 
+                            putchar('A'); 
+                            putchar('='); 
+                            putchar('"'); 
+                            putchar('R'); 
+                            putchar('E'); 
+                            putchar('D'); 
+                            putchar('I'); 
+                            putchar('R'); 
+                            putchar('"'); 
+                            putchar(',');
+                            putchar('1'); 
+                            putchar(0x0D); 
+                            putchar(0x0A); 
+                            estado = 5;
+                            break;
+                case 5:
+                
+                            timerSendFirebase = 45;//*32ms=~1000ms
+                            putchar('A'); 
+                            putchar('T'); 
+                            putchar('+'); 
+                            putchar('H'); 
+                            putchar('T');
+                            putchar('T'); 
+                            putchar('P'); 
+                            putchar('P'); 
+                            putchar('A'); 
+                            putchar('R'); 
+                            putchar('A'); 
+                            putchar('='); 
+                            putchar('"'); 
+                            putchar('C'); 
+                            putchar('O');
+                            putchar('N'); 
+                            putchar('T'); 
+                            putchar('E'); 
+                            putchar('N'); 
+                            putchar('T'); 
+                            putchar('"'); 
+                            putchar(','); 
+                            putchar('"'); 
+                            putchar('a'); 
+                            putchar('p'); 
+                            putchar('p'); 
+                            putchar('l'); 
+                            putchar('i'); 
+                            putchar('c'); 
+                            putchar('a'); 
+                            putchar('t'); 
+                            putchar('i'); 
+                            putchar('o'); 
+                            putchar('n'); 
+                            putchar('/'); 
+                            putchar('j'); 
+                            putchar('s'); 
+                            putchar('o'); 
+                            putchar('n'); 
+                            putchar('"'); 
+                            putchar(0x0D); 
+                            putchar(0x0A);
+                            estado = 6;
+                            break;
+                case 6:
+                            timerSendFirebase = 65;//*32ms=~1000ms 
+                            putchar('A'); 
+                            putchar('T'); 
+                            putchar('+'); 
+                            putchar('H'); 
+                            putchar('T'); 
+                            putchar('T'); 
+                            putchar('P'); 
+                            putchar('D'); 
+                            putchar('A'); 
+                            putchar('T'); 
+                            putchar('A');
+                            putchar('=');
+                            putchar((jsonSize / 100) + '0');      // Centenas
+                            putchar((jsonSize % 100 / 10) + '0'); // Decenas
+                            putchar((jsonSize % 10) + '0');       // Unidades
+                            putchar(',');
+                            putchar('5'); 
+                            putchar('0'); 
+                            putchar('0'); 
+                            putchar('0'); 
+                            putchar(0x0D); 
+                            putchar(0x0A);
+                            estado = 7;
+                            break;
+                case 7: 
+                  
+                            timerSendFirebase = 35;//*32ms~=6500ms 
+                            for(i = 0; i < jsonSize; i++)  
+                            {
+                                if(JSONLegacy[i] == 0x00)
+                                {
+                                    putchar(' ');
+                                } 
+                                else putchar(JSONLegacy[i]);  // Envio de la cadena completa
+                            } 
+                            putchar(0x0D); 
+                            putchar(0x0A);
+                            estado = 8;
+                            break;
+                case 8:
+                            timerSendFirebase = 85;//*32ms=~1000ms
+                            putchar('A'); 
+                            putchar('T'); 
+                            putchar('+'); 
+                            putchar('H'); 
+                            putchar('T'); 
+                            putchar('T'); 
+                            putchar('P'); 
+                            putchar('A'); 
+                            putchar('C'); 
+                            putchar('T'); 
+                            putchar('I'); 
+                            putchar('O');
+                            putchar('N'); 
+                            putchar('='); 
+                            putchar('1');
+                            putchar(0x0D); 
+                            putchar(0x0A);
+                            estado = 9;
+                            break;
+                case 9:
+                            timerSendFirebase = 320;//*32ms~=40000ms //Espera de 25 segundos para realizar post todo depende del tama?o del Json y como ande de humor Firebase
+                            estado = 10;
+                            setResponse();
+                            break;
+                case 10:     //Termino de Peticion  
+                            timerSendFirebase = 9;//*32ms=~2000ms
+                            putchar('A'); 
+                            putchar('T'); 
+                            putchar('+'); 
+                            putchar('H'); 
+                            putchar('T'); 
+                            putchar('T'); 
+                            putchar('P'); 
+                            putchar('T'); 
+                            putchar('E'); 
+                            putchar('R'); 
+                            putchar('M');
+                            putchar('='); 
+                            putchar('1');
+                            putchar(0x0D); 
+                            putchar(0x0A);
+                            lcd_putsf(".");
+                            estado = 11;
+                            break;
+                default:    
+                           if (strstr(firebaseResponse,"1,200") != NULL  || intentos == 0){
+                                simGprs_gprsDesconect();
+                                enableInterruptions();
+                                estado=0;
+                                fire = 0;
+                                #asm("sei");
+                                tiempoLog = e_TiempoLog;
+                                intentos = e_numeroReintentos;
+                                delay_ms(400);
+                                for (i = 0; i < sizeof(firebaseResponse);i++){
+                                   firebaseResponse[i] = '\0';
+                                }
+                                   
+                           } else {
+                               delay_ms(400);
+                               estado=0;  
+                               fire = 0;
+                               sendLog();
+                               intentos--;
+                           }
+            }
+    }
+//    else if(!fire && !timerSendFirebase) 
+//    {
+//        lcd_clear();
+//        lcd_gotoxy(0,0);
+//        lcd_putsf("salio: ");   
+//        lcd_putchar(message_state);
+//    }   
+}
+
+
+
+void conectServer(void)
+{
+    putchar('A');
+    putchar('T');
+    putchar('+');
+    putchar('C');
+    putchar('N');
+    putchar('T');
+    putchar('P');
+    putchar('=');
+    putchar('"');
+    putchar('t');
+    putchar('i');
+    putchar('m');
+    putchar('e');
+    putchar('.');
+    putchar('g');
+    putchar('o');
+    putchar('o');
+    putchar('g');
+    putchar('l');
+    putchar('e');
+    putchar('.');
+    putchar('c');
+    putchar('o');
+    putchar('m');
+    putchar('"');
+    putchar(',');
+    putchar('-');
+    putchar('2');
+    putchar('4');
+    putchar(0x0D);  
+    putchar(0x0A);  
+    delay_ms(500);
+                 
+    putchar('A');
+    putchar('T');
+    putchar('+');
+    putchar('C');
+    putchar('N');
+    putchar('T');
+    putchar('P');
+    putchar(0x0D); 
+    putchar(0x0A);      
+    delay_ms(1500);    
+}
+
+void inicializarSim800(void)
+{
+    simGprs_at();
+    lcd_gotoxy(0,0);
+    lcd_putsf("conectando con  ");
+    lcd_gotoxy(0,1);
+    lcd_putsf("el modulo");
+    delay_ms(1000);
+    lcd_putsf(".");
+    delay_ms(2000);
+    lcd_putsf(".");
+    delay_ms(2000);
+    lcd_putsf(".");
+    delay_ms(3000);
+    lcd_clear();
+    for(i=0;i<5;i++)
+    {
+        lcd_putchar(i + 0x31);
+        simGprs_at(); 
+        delay_ms(500);
+        for(j=0;j<9;j++)
+        {
+            lcd_putchar(d[j]);
+        } 
+        if(d[0]=='A' || g==9)
+        {
+            lcd_gotoxy(0,0);
+            lcd_putsf("conexion: ");
+            lcd_putsf("OK");
+            i=6;
+            delay_ms(1000);
+        }
+        lcd_clear();
+    } 
+    if(i==5 && g!=9)
+    {
+        lcd_putsf("ERROR"); 
+        lcd_gotoxy(0,1);
+        for(i=0;i<5;i++)
+        {
+            lcd_putchar(d[i]);    
+        }
+        return;
+    }
+    lcd_clear();
+    for(i=0;i<5;i++)
+    {
+        simGprs_fuerzaDeSenal();
+        delay_ms(300);
+        if(d[15]>0x30 && d[15]<0x40)
+        { 
+            i=6;
+        }   
+    }
+    if(d[15]>0x30)
+    {
+        lcd_gotoxy(0,0);
+        lcd_putsf("CONECTADO :");
+        lcd_putchar(d[15]);
+        if(d[16]>=0x30 && d[16]<=0x49)
+            lcd_putchar(d[16]);
+    }
+    else
+    {
+        lcd_gotoxy(0,0);
+        lcd_putsf("SIN SENAL");
+    }
+    delay_ms(500);
+    simGprs_activarTimestampGprs();//SE HABILITA ADQUIRIR HORA DE RED                 
+    delay_ms(3000);
+    lcd_clear();
+    
+}
+void recepcionLdr(void)
+{
+    if(n_bits_rx == 20)
+    {
+        lcd_clear();
+        tiempoLog = 220;
+        n_bits_rx = 0;             
+        datore = dato_trab & 0x00FFFFF0;        //
+        datore >>= 4;        //
+        comando = dato_trab & 0x0000000F;
+        lcd_gotoxy(0,0); 
+        lcd_putsf("comando:");
+        itoa(comando,cadena);
+        lcd_puts(cadena); 
+        lcd_gotoxy(0,1);
+        lcd_putsf("dato:");
+        lcd_gotoxy(7,1);
+        ltoa(datore,cadena);
+        lcd_puts(cadena);
+        PILOTO1 = 1;
+        if (!comando){
+           lcd_gotoxy(0,2); 
+           lcd_putsf("INVENTARIO");
+           e_Inventario = datore;
+           updateStockemprom = e_Inventario - Stock;
+           Stock = e_Inventario;
+           caseLog = 5;
+        }
+        if (comando){
+           lcd_gotoxy(0,2); 
+           lcd_putsf("TARIFA");
+           e_Tarifa = datore;
+           tarifa = e_Tarifa;
+           caseLog = 6;
+        }
+        if (comando == 2){
+           lcd_gotoxy(0,2); 
+           lcd_putsf("TIEMPO LOG");
+           e_TiempoLog = (datore * 3600);
+           tiempoLog = e_TiempoLog;
+           caseLog = 7;
+        }
+        if (comando == 3){
+           lcd_gotoxy(0,2); 
+           lcd_putsf("CANT. DE VENTAS PARA LOG");
+           e_LimiteVentas = datore;
+           limiteventas = e_LimiteVentas;
+           caseLog = 10;
+        }
+        if (comando == 4){
+           lcd_gotoxy(0,2); 
+           lcd_putsf("REINTENTOS PARA LOG");
+           e_numeroReintentos = datore;
+           intentos = e_numeroReintentos;
+           caseLog = 9;
+        }
+        if (comando == 5){
+           lcd_gotoxy(0,2); 
+           lcd_putsf("MONTO PARA LOG");
+           e_LimiteMonto = datore;
+           limiteMonto = e_LimiteMonto;
+           caseLog = 8;
+        }
+        if (comando == 6){
+           lcd_gotoxy(0,2); 
+           lcd_putsf("INVENTARIO BAJO");
+           e_Inventariobajo = datore;
+           caseLog = 12;
+        }
+        delay_ms(2500);
+        lcd_clear();
+        PILOTO1 = 0;
+        sendLog();
+    }
+}
